@@ -1,0 +1,12 @@
+venv/
+.vscode
+data/all_c_cpp_release2.0.csv
+data/MSR_data_cleaned.csv
+models/hf_cache
+__pycache__
+archive
+logs
+/logs
+/cache
+cache
+

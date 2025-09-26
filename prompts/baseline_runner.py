@@ -1,0 +1,171 @@
+# File:         prompts/baseline_runner.py
+# Author:       Lea Button
+# Date:         25-09-2025
+# Description:  Class to run baseline predictions using a pre-trained language model.
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, AutoConfig
+from accelerate import init_empty_weights
+import torch
+import re
+import os
+
+CACHE_DIR = "./cache/hf_cache"
+
+class BaselineRunner:
+    """Class to run baseline predictions using a pre-trained language model."""
+    def __init__(self, model_name: str, device: str = None, max_new_tokens: int = 50, 
+                 safetensors: bool = False, batch_size: int = 8, use_accelerate: bool = False):
+        """
+        Loads a pre-trained model and tokenizer for baseline generation.
+        
+        Parameters
+        ----------
+        model_name : str
+            The name of the pre-trained model to load (e.g., "bigcode/starcoder2-3b").
+        device : str, optional
+            The device to run the model on ("cuda" or "cpu"). If None, automatically selects based on availability.
+        max_new_tokens : int, optional
+            The maximum number of new tokens to generate for each prompt.
+        safetensors : bool, optional
+            Whether to use the safetensors format for loading the model.
+        batch_size : int, optional
+            The batch size for generation.
+        use_accelerate : bool, optional
+            Whether to use the accelerate library for memory-efficient loading.
+        """
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        self.use_accelerate = use_accelerate
+        self.device = device
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, 
+                                                        cache_dir=CACHE_DIR,
+                                                        use_safetensors=safetensors,
+                                                        token=os.getenv("HUGGINGFACE_TOKEN"))
+        
+        if self.tokenizer.pad_token is None:
+            # Use eos_token as pad_token if not defined
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        if use_accelerate:
+            config = AutoConfig.from_pretrained(model_name)
+            
+            with init_empty_weights():
+                _ = AutoModelForCausalLM.from_config(config)
+                
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                offload_folder="offload",
+                cache_dir=CACHE_DIR,
+            )
+            
+            self.generator = pipeline(
+                "text-generation",
+                model=self.model,
+                tokenizer=self.tokenizer,
+                batch_size=batch_size,
+            )
+            
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, 
+                                                            torch_dtype=torch.float16 
+                                                            if torch.cuda.is_available() 
+                                                            else torch.float32,
+                                                            cache_dir=CACHE_DIR,
+                                                            use_safetensors=safetensors)
+        
+            self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model.to(self.device)
+        
+            self.generator = pipeline(
+                "text-generation",
+                model=self.model,
+                tokenizer=self.tokenizer,
+                device=0 if self.device == 'cuda' else -1,
+                batch_size=batch_size,  
+            )
+        
+
+    def run_prompt(self, prompt: str) -> str:
+            """
+            Runs a prompt through the model and returns the generated text.
+            
+            Parameters
+            ----------
+            prompt : str
+                The input prompt string.
+                
+            Returns
+            -------
+            str
+                The generated text from the model.
+            """
+            outputs = self.generator(prompt, 
+                                     max_new_tokens=self.max_new_tokens, 
+                                     do_sample=False,
+                                     return_full_text=False,
+                                     output_attentions=False, 
+                                     output_hidden_states=False)
+            return outputs[0]['generated_text']
+    
+    
+    def extract_line_numbers(self, generated_text: str) -> list[int]:
+        """
+        Attempts to extract line numbers from the generated text.
+        
+        Parameters
+        ----------
+        generated_text : str
+            The text generated by the model.
+            
+        Returns
+        -------
+        list[int]
+            A list of extracted line numbers.
+        """
+        match = re.findall(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]", generated_text)
+        numbers = []
+        
+        for group in match:
+            nums = re.findall(r"\d+", group)
+            numbers.extend(map(int, nums))
+
+        return numbers
+    
+    
+    def run_prompt_batch(self, prompts: list[str]) -> list[str]:
+        """
+        Runs a batch of prompts through the model and returns generated texts.
+        
+        Parameters
+        ----------
+        prompts : list of str
+            A list of input prompt strings.
+            
+        Returns
+        -------
+        list[str]
+            A list of generated texts from the model.
+        """        
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        input_lengths = [len(self.tokenizer(prompt, return_tensors="pt")["input_ids"][0]) for prompt in prompts]
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                output_attentions=False, 
+                output_hidden_states=False,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+            
+        decoded = []
+        for output, prompt_len in zip(outputs, input_lengths):
+            generated_tokens = output[prompt_len:]  # Only the new tokens
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            decoded.append(text)
+
+        return decoded
